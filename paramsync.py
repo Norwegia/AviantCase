@@ -108,12 +108,12 @@ def get_reference_params(connection: mavutil.mavlink_connection) -> Optional[str
         if response.status_code == 200:
             return parse_params_file(response.text)
         else:
-            message = f"GET request to reference parameters from {PARAMS_URL} failed with response code {response.status_code}"
+            message = f"Failed to fetch reference parameters: {response.status_code}"
     except (requests.exceptions.ConnectionError,
             requests.exceptions.ConnectTimeout,
             requests.exceptions.ReadTimeout,
             requests.exceptions.RequestException):
-        message = f"GET request to reference parameters from {PARAMS_URL} timed out"
+        message = f"GET request to reference parameters timed out"
     logger.error(message)
     connection.mav.statustext_send(
         mavutil.mavlink.MAV_SEVERITY_NOTICE, message.encode("utf-8"))
@@ -234,8 +234,8 @@ def update_drone_params(params: Dict[str, Dict[str, Any]], connection: mavutil.m
     return unacknowlaged
 
 
-def create_qgc_sync_message(diff: Dict[str, Dict[str, Any]],
-                            unrecognized_params: Dict[str, Dict[str, Any]], unsynced_params: Dict[str, Dict[str, Any]]) -> str:
+def create_log_message(diff: Dict[str, Dict[str, Any]],
+                       unrecognized_params: Dict[str, Dict[str, Any]], unsynced_params: Dict[str, Dict[str, Any]]) -> str:
     """
     Generate a human-readable status message for QGroundControl display.
 
@@ -330,14 +330,14 @@ def main() -> None:
                         if diff:
                             unacknowledged_params = update_drone_params(
                                 diff, connection)
-                            message = create_qgc_sync_message(
+                            message = create_log_message(
                                 diff, unrecognized_params, unacknowledged_params)
                             for param, value in diff.items():
                                 if param not in unacknowledged_params and param not in unrecognized_params:
                                     drone_params[param] = value
                             logger.info(message)
                             connection.mav.statustext_send(
-                                mavutil.mavlink.MAV_SEVERITY_NOTICE, message.encode("utf-8"))
+                                mavutil.mavlink.MAV_SEVERITY_NOTICE, b"Synced onboard params to online reference")
                             if REBOOT_ON_SYNC:
                                 connection.reboot_autopilot()
 
