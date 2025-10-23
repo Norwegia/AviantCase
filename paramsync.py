@@ -12,13 +12,19 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
+
 PARAMS_URL = "https://caseparams.sandbox.aviant.no/reference.params"
 MAVLINK_CONNECTION_URLS = [
     "/dev/tty.usbmodem01",  # OSX USB
-    "/dev/ttyAMA0",  # Linux Serial
+    # "/dev/ttyAMA0",  # Linux Serial
     # "udpin:localhost:14540" # SITL
 ]
 BAUD = 57600
+REBOOT_ON_SYNC = False  # should the vehicle reboot when new parameters are synced
+REF_PARAMS_REFRESH_PERIOD = 1  # s
+REF_PARAMS_GET_TIMEOUT = 2     # s
+PARAM_ACKNOWLEDGE_TIMEOUT = 2  # s
+
 MAV_PARAM_TYPE = {
     1: int,
     2: int,
@@ -44,25 +50,6 @@ MAV_PARAM_FORMAT_TYPE = {
     9: 'f',
     10: 'd',
 }
-
-REF_PARAMS_REFRESH_PERIOD = 1  # s
-ACKNOWLEDGE_TIMEOUT = 2  # s
-
-
-def get_reference_params() -> Optional[str]:
-    """
-    Fetch reference parameters from the remote URL.
-
-    Makes an HTTP GET request to PARAMS_URL to retrieve the reference
-    parameter file containing the latest parameter configurations.
-
-    Returns:
-        Optional[str]: The response text containing parameter data if successful,
-                      None if the request fails or returns a non-200 status code.
-    """
-    response = requests.get(PARAMS_URL)
-    if response.status_code == 200:
-        return response.text
 
 
 def parse_params_file(file: str) -> Dict[str, Dict[str, Any]]:
@@ -101,20 +88,32 @@ def parse_params_file(file: str) -> Dict[str, Dict[str, Any]]:
     return key_value_pairs
 
 
-def refresh_reference_params() -> Dict[str, Dict[str, Any]]:
+def get_reference_params(connection: mavutil.mavlink_connection) -> Optional[str]:
     """
-    Fetch and parse the latest reference parameters from the remote source.
+    Fetch reference parameters from the remote URL.
 
-    Combines get_reference_params() and parse_params_file() to retrieve
-    the most current parameter configuration and return it in a structured format.
+    Makes an HTTP GET request to PARAMS_URL to retrieve the reference
+    parameter file containing the latest parameter configurations. 
+    Notifies QGroundControl & logs if request fails.
 
     Returns:
-        Dict[str, Dict[str, Any]]: Parsed parameter dictionary with parameter names
-                                  as keys and dictionaries containing 'Value' and 'Type'
-                                  as values. Returns empty dict if fetch fails.
+        Optional[str]: A JSON formatted dict of the parameter data if successful,
+                      None if the request fails or returns a non-200 status code.
     """
-    text = get_reference_params()
-    return parse_params_file(text)
+    try:
+        response = requests.get(PARAMS_URL, timeout=REF_PARAMS_GET_TIMEOUT)
+        if response.status_code == 200:
+            return parse_params_file(response.text)
+        else:
+            message = f"GET request to reference parameters from {PARAMS_URL} failed with response code {response.status_code}"
+    except (requests.exceptions.ConnectionError,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.RequestException):
+        message = f"GET request to reference parameters from {PARAMS_URL} timed out"
+    logger.error(message)
+    connection.mav.statustext_send(
+        mavutil.mavlink.MAV_SEVERITY_NOTICE, message.encode("utf-8"))
 
 
 def get_params_on_drone(connection: mavutil.mavlink_connection) -> Dict[str, Dict[str, Any]]:
@@ -141,11 +140,11 @@ def get_params_on_drone(connection: mavutil.mavlink_connection) -> Dict[str, Dic
     params = {}
     while True:
         message = connection.recv_match(
-            type="PARAM_VALUE", blocking=True, timeout=1)
+            type="PARAM_VALUE", blocking=True, timeout=PARAM_ACKNOWLEDGE_TIMEOUT)
         if message is None:
             break
         value = struct.unpack(MAV_PARAM_FORMAT_TYPE[message.param_type], struct.pack(
-            'f', message.param_value))[0]  # typeprune from float
+            'f', message.param_value))[0]  # reinterpret float as proper data type
         params[message.param_id] = {
             "Value": value,
             "Type": message.param_type
@@ -154,14 +153,14 @@ def get_params_on_drone(connection: mavutil.mavlink_connection) -> Dict[str, Dic
     return params
 
 
-def compare_param_list(reference_params: Dict[str, Dict[str, Any]],
-                       drone_params: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+def compare_param_lists(reference_params: Dict[str, Dict[str, Any]],
+                        drone_params: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """
     Compare reference parameters against drone parameters to find differences.
 
     Identifies parameters that exist in both lists but have different values,
-    and parameters that exist in the reference but not on the drone. Uses an
-    optimization to track the last match index for efficient comparison.
+    and parameters that exist in the reference but not on the drone. Expects 
+    both lists to be sorted alphabetically.
 
     Args:
         reference_params (Dict[str, Dict[str, Any]]): Reference parameter dictionary
@@ -181,7 +180,7 @@ def compare_param_list(reference_params: Dict[str, Dict[str, Any]],
     for ref_param, ref_value in reference_params.items():
         for idx, drone_param in enumerate(list(drone_params.keys())[last_match_idx:]):
             if ref_param == drone_param:
-                last_match_idx = idx + 1
+                last_match_idx = idx + 1  # make use of alphabetic sorting to optimize parsing
                 drone_value = drone_params[drone_param]
                 if ref_value != drone_value:
                     diff[ref_param] = ref_value
@@ -212,7 +211,7 @@ def update_drone_params(params: Dict[str, Dict[str, Any]], connection: mavutil.m
     unacknowlaged = {}
     for param, value in params.items():
         packed_value = struct.unpack('f', struct.pack(
-            MAV_PARAM_FORMAT_TYPE[value["Type"]], value["Value"]))[0]  # typeprune to float
+            MAV_PARAM_FORMAT_TYPE[value["Type"]], value["Value"]))[0]  # reinterpret as float
         connection.mav.param_set_send(
             connection.target_system,
             connection.target_component,
@@ -223,9 +222,9 @@ def update_drone_params(params: Dict[str, Dict[str, Any]], connection: mavutil.m
         unacknowlaged[param] = value
 
     start_time = time.perf_counter()
-    while time.perf_counter() - start_time < ACKNOWLEDGE_TIMEOUT and unacknowlaged:
+    while unacknowlaged and time.perf_counter() - start_time < PARAM_ACKNOWLEDGE_TIMEOUT:
         message = connection.recv_match(
-            type="PARAM_VALUE", blocking=True, timeout=ACKNOWLEDGE_TIMEOUT)
+            type="PARAM_VALUE", blocking=True, timeout=PARAM_ACKNOWLEDGE_TIMEOUT)
         if message:
             if message.param_id.strip() in unacknowlaged:
                 unacknowlaged.pop(message.param_id)
@@ -294,19 +293,24 @@ def main() -> None:
         logger.info("Timed out waiting for heartbeat, trying again...")
         heartbeat = connection.recv_match(
             type="HEARTBEAT", blocking=True, timeout=10)
-    logger.info("Got heartbeat!")
+    logger.info("Got heartbeat")
+
     drone_params = get_params_on_drone(connection)
-    reference_params = refresh_reference_params()
-    ref_param_update_time = time.perf_counter()
+    reference_params = None
+    while reference_params is None:  # check for internet connection
+        reference_params = get_reference_params(connection)
+    ref_param_last_update = time.perf_counter()
     armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
 
     while True:
         if not armed:
             diff = {}
-            if time.perf_counter() - ref_param_update_time > REF_PARAMS_REFRESH_PERIOD:
-                reference_params = get_reference_params()
-                reference_params = refresh_reference_params()
-                diff, unrecognized_params = compare_param_list(
+            if time.perf_counter() - ref_param_last_update > REF_PARAMS_REFRESH_PERIOD:
+                reference_params = get_reference_params(connection)
+                ref_param_last_update = time.perf_counter()
+                if reference_params is None:  # failed to fetch from website
+                    continue
+                diff, unrecognized_params = compare_param_lists(
                     reference_params, drone_params)
                 if diff:
                     unacknowledged_params = update_drone_params(
