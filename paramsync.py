@@ -1,8 +1,9 @@
-from pymavlink import mavutil
 import requests
 import time
 import struct
 import logging
+import serial
+from pymavlink import mavutil
 from typing import Dict, Any, Tuple, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -12,7 +13,11 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 PARAMS_URL = "https://caseparams.sandbox.aviant.no/reference.params"
-MAVLINK_CONNECTION_URL = "/dev/tty.usbmodem01"
+MAVLINK_CONNECTION_URLS = [
+    "/dev/tty.usbmodem01",  # OSX USB
+    "/dev/ttyAMA0",  # Linux Serial
+    # "udpin:localhost:14540" # SITL
+]
 BAUD = 57600
 MAV_PARAM_TYPE = {
     1: int,
@@ -271,12 +276,17 @@ def main() -> None:
     This is a simpler, single-threaded implementation that periodically refreshes
     both reference parameters and drone parameters, then synchronizes any differences.
     """
-    connection = mavutil.mavlink_connection(MAVLINK_CONNECTION_URL, baud=BAUD)
+    connection = False
+    for url in MAVLINK_CONNECTION_URLS:
+        try:
+            connection = mavutil.mavlink_connection(url, baud=BAUD)
+        except serial.serialutil.SerialException:
+            logger.error(f"Could not open {url}")
     if not connection:
         logger.info(
-            f"Failed to establish MAVLink connection at {MAVLINK_CONNECTION_URL}")
+            f"Failed to establish MAVLink connection with any of {MAVLINK_CONNECTION_URLS}")
         return
-    logger.info(f"Mavlink connection established at:{MAVLINK_CONNECTION_URL}")
+    logger.info(f"MAVlink connection established at: {url}")
     logger.info("Waiting for heartbeat...")
     heartbeat = connection.recv_match(
         type="HEARTBEAT", blocking=True, timeout=10)
@@ -284,10 +294,9 @@ def main() -> None:
         logger.info("Timed out waiting for heartbeat, trying again...")
         heartbeat = connection.recv_match(
             type="HEARTBEAT", blocking=True, timeout=10)
-    logger.info("Got heartbeat")
+    logger.info("Got heartbeat!")
     drone_params = get_params_on_drone(connection)
-    reference_params = get_reference_params()
-    reference_params = parse_params_file(reference_params)
+    reference_params = refresh_reference_params()
     ref_param_update_time = time.perf_counter()
     armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
 
@@ -296,8 +305,7 @@ def main() -> None:
             diff = {}
             if time.perf_counter() - ref_param_update_time > REF_PARAMS_REFRESH_PERIOD:
                 reference_params = get_reference_params()
-                reference_params = parse_params_file(reference_params)
-                ref_param_update_time = time.perf_counter()
+                reference_params = refresh_reference_params()
                 diff, unrecognized_params = compare_param_list(
                     reference_params, drone_params)
                 if diff:
