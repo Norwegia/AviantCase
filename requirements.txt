@@ -1,0 +1,8 @@
+certifi==2025.10.5
+charset-normalizer==3.4.4
+fastcrc==0.3.3
+idna==3.11
+lxml==6.0.2
+pymavlink==2.4.49
+requests==2.32.5
+urllib3==2.5.0
