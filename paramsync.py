@@ -3,8 +3,6 @@ import requests
 import time
 import struct
 import logging
-import threading
-import queue
 from typing import Dict, Any, Tuple, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -43,7 +41,7 @@ MAV_PARAM_FORMAT_TYPE = {
 }
 
 REF_PARAMS_REFRESH_PERIOD = 1  # s
-DRONE_PARAMS_REFRESH_PERIOD = 10  # s
+ACKNOWLEDGE_TIMEOUT = 2  # s
 
 
 def get_reference_params() -> Optional[str]:
@@ -190,8 +188,7 @@ def compare_param_list(reference_params: Dict[str, Dict[str, Any]],
     return diff, unrecognized_params
 
 
-def update_drone_params(params: Dict[str, Dict[str, Any]],
-                        connection: mavutil.mavlink_connection, connection_read_lock: threading.Lock) -> List[str]:
+def update_drone_params(params: Dict[str, Dict[str, Any]], connection: mavutil.mavlink_connection) -> List[str]:
     """
     Send parameter updates to the drone and verify acknowledgment.
 
@@ -202,15 +199,13 @@ def update_drone_params(params: Dict[str, Dict[str, Any]],
     Args:
         params (Dict[str, Dict[str, Any]]): Parameters to update with 'Value' and 'Type'.
         connection (mavutil.mavlink_connection): Active MAVLink connection to the drone.
-        connection_read_lock (threading.Lock): Lock for thread-safe connection reading.
 
     Returns:
         List[str]: List of parameter names that were not acknowledged by the drone
                    within the timeout period.
     """
-    unacknowlaged = []
+    unacknowlaged = {}
     for param, value in params.items():
-        print(value["Value"])
         packed_value = struct.unpack('f', struct.pack(
             MAV_PARAM_FORMAT_TYPE[value["Type"]], value["Value"]))[0]  # typeprune to float
         connection.mav.param_set_send(
@@ -220,15 +215,19 @@ def update_drone_params(params: Dict[str, Dict[str, Any]],
             packed_value,
             value["Type"]
         )
-        with connection_read_lock:
-            message = connection.recv_match(
-                type="PARAM_VALUE", blocking=True, timeout=0.5)
-            if not message or message.param_id.strip() != param:
-                unacknowlaged.append(param)
+        unacknowlaged[param] = value
+
+    start_time = time.perf_counter()
+    while time.perf_counter() - start_time < ACKNOWLEDGE_TIMEOUT and unacknowlaged:
+        message = connection.recv_match(
+            type="PARAM_VALUE", blocking=True, timeout=ACKNOWLEDGE_TIMEOUT)
+        if message:
+            if message.param_id.strip() in unacknowlaged:
+                unacknowlaged.pop(message.param_id)
     return unacknowlaged
 
 
-def create_QGC_sync_message(diff: Dict[str, Dict[str, Any]],
+def create_qgc_sync_message(diff: Dict[str, Dict[str, Any]],
                             unrecognized_params: Dict[str, Dict[str, Any]], unsynced_params: Dict[str, Dict[str, Any]]) -> str:
     """
     Generate a human-readable status message for QGroundControl display.
@@ -290,278 +289,35 @@ def main() -> None:
     reference_params = get_reference_params()
     reference_params = parse_params_file(reference_params)
     ref_param_update_time = time.perf_counter()
-    drone_param_update_time = time.perf_counter()
     armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+
     while True:
         if not armed:
             diff = {}
-            refresh = False
-
             if time.perf_counter() - ref_param_update_time > REF_PARAMS_REFRESH_PERIOD:
                 reference_params = get_reference_params()
                 reference_params = parse_params_file(reference_params)
                 ref_param_update_time = time.perf_counter()
-                refresh = True
-
-            if time.perf_counter() - drone_param_update_time > DRONE_PARAMS_REFRESH_PERIOD:
-                drone_params = get_params_on_drone(connection)
-                drone_param_update_time = time.perf_counter()
-                refresh = True
-
-            if refresh:
                 diff, unrecognized_params = compare_param_list(
                     reference_params, drone_params)
+                if diff:
+                    unacknowledged_params = update_drone_params(
+                        diff, connection)
+                    message = create_qgc_sync_message(
+                        diff, unrecognized_params, unacknowledged_params)
+                    logger.info(message)
+                    for param, value in diff.items():
+                        if param not in unacknowledged_params and param not in unrecognized_params:
+                            drone_params[param] = value
+                    connection.mav.statustext_send(
+                        mavutil.mavlink.MAV_SEVERITY_NOTICE, message.encode("utf-8"))
 
-            if diff:
-                unsynced = update_drone_params(diff)
-                message = create_QGC_sync_message(
-                    diff, unrecognized_params, unsynced)
-                logger.info(message)
-                drone_param_update_time = time.perf_counter()
-                for param, value in diff.items():
-                    if param not in unsynced:
-                        drone_params[param] = value
-                connection.mav.statustext_send(
-                    mavutil.mavlink.MAV_SEVERITY_NOTICE, message.encode("utf-8"))
-
-        heartbeat = connection.recv_match(type="HEARTBEAT", blocking=False)
+        heartbeat = connection.recv_match(
+            type="HEARTBEAT", blocking=True, timeout=1)
         if heartbeat:
+            logger.info("Got heartbeat")
             armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
 
 
-class FetchRefParamsThread(threading.Thread):
-    """
-    Worker thread that periodically fetches and compares reference parameters.
-
-    Runs in a loop fetching reference parameters from the remote URL and comparing
-    them against current drone parameters. When differences are found and the drone
-    is disarmed, stages the changes for the update thread to process.
-
-    Attributes:
-        arm_event (threading.Event): Indicates if drone is armed (blocks operations when set)
-        stage_event (threading.Event): Signals when changes are staged for update
-        stop_event (threading.Event): Signals thread to stop execution
-        staged_changes (queue.Queue): Queue for parameter changes to be applied
-        unrecognized_params (queue.Queue): Queue for parameters not found on drone
-        drone_params (Dict[str, Dict[str, Any]]): Current drone parameter cache
-        drone_params_lock (threading.Lock): Lock for thread-safe access to drone_params
-    """
-
-    def __init__(self,
-                 arm_event: threading.Event,
-                 stage_event: threading.Event,
-                 stop_event: threading.Event,
-                 staged_changes: queue.Queue,
-                 unrecognized_params: queue.Queue,
-                 drone_params: Dict[str, Dict[str, Any]],
-                 drone_params_lock: threading.Lock) -> None:
-        threading.Thread.__init__(self)
-        self.arm_event = arm_event
-        self.stage_event = stage_event
-        self.stop_event = stop_event
-        self.staged_changes = staged_changes
-        self.unrecognized_params = unrecognized_params
-        self.drone_params = drone_params
-        self.drone_params_lock = drone_params_lock
-
-    def run(self):
-        while not self.stop_event.wait(REF_PARAMS_REFRESH_PERIOD):
-            if not self.arm_event.is_set():
-                with self.drone_params_lock:
-                    reference_params = get_reference_params()
-                    reference_params = parse_params_file(reference_params)
-                    diff, unrecognized_params = compare_param_list(
-                        reference_params, self.drone_params)
-                    print("params fetched")
-                    if diff:
-                        self.staged_changes.put(diff)
-                        self.unrecognized_params.put(unrecognized_params)
-                        self.stage_event.set()
-
-
-class HeartbeatThread(threading.Thread):
-    """
-    Worker thread that monitors drone heartbeat and arm/disarm status.
-
-    Continuously listens for HEARTBEAT messages from the drone and updates
-    the arm_event based on the drone's armed state. This allows other threads
-    to safely perform operations only when the drone is disarmed.
-
-    Attributes:
-        connection (mavutil.mavlink_connection): MAVLink connection to the drone
-        connection_lock (threading.Lock): Lock for thread-safe connection access
-        arm_event (threading.Event): Event that reflects drone armed state
-        stop_event (threading.Event): Signals thread to stop execution
-    """
-
-    def __init__(self,
-                 connection: mavutil.mavlink_connection,
-                 connection_lock: threading.Lock,
-                 arm_event: threading.Event,
-                 stop_event: threading.Event) -> None:
-        threading.Thread.__init__(self)
-        self.connection = connection
-        self.connection_lock = connection_lock
-        self.arm_event = arm_event
-        self.stop_event = stop_event
-
-    def run(self):
-        while not self.stop_event.is_set():
-            time.sleep(1)  # avoiding hogging the connection read lock
-            with self.connection_lock:
-                heartbeat = self.connection.recv_match(
-                    type="HEARTBEAT", blocking=False)
-                if heartbeat:
-                    print("Got heartbeat")
-                    armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                    if self.arm_event.is_set() and not armed:
-                        self.arm_event.clear()
-                    elif not self.arm_event.is_set() and armed:
-                        self.arm_event.set()
-
-
-class ParamUpdateThread(threading.Thread):
-    """
-    Worker thread that applies staged parameter changes to the drone.
-
-    Waits for parameter changes to be staged and applies them to the drone
-    when the drone is disarmed. Sends the parameter updates via MAVLink and
-    creates status messages for QGroundControl display.
-
-    Attributes:
-        stage_event (threading.Event): Signals when changes are staged for update
-        arm_event (threading.Event): Indicates if drone is armed (blocks operations when set)
-        stop_event (threading.Event): Signals thread to stop execution
-        connection (mavutil.mavlink_connection): MAVLink connection to the drone
-        connection_write_lock (threading.Lock): Lock for thread-safe connection writing
-        connection_read_lock (threading.Lock): Lock for thread-safe connection reading
-        staged_changes (queue.Queue): Queue containing parameter changes to apply
-        unrecognized_params (queue.Queue): Queue containing parameters not found on drone
-    """
-
-    def __init__(self,
-                 stage_event: threading.Event,
-                 arm_event: threading.Event,
-                 stop_event: threading.Event,
-                 connection: mavutil.mavlink_connection,
-                 connection_write_lock: threading.Lock,
-                 connection_read_lock: threading.Lock,
-                 staged_changes: queue.Queue,
-                 unrecognized_params: queue.Queue) -> None:
-        threading.Thread.__init__(self)
-        self.connection = connection
-        self.connection_write_lock = connection_write_lock
-        self.connection_read_lock = connection_read_lock
-        self.stage_event = stage_event
-        self.arm_event = arm_event
-        self.stop_event = stop_event
-        self.staged_changes = staged_changes
-        self.unrecognized_params = unrecognized_params
-
-    def run(self):
-        while not self.stop_event.is_set():
-            if self.stage_event.is_set() and not self.arm_event.is_set():
-                print("Change staged")
-                with self.connection_write_lock:
-                    diff = self.staged_changes.get()
-                    diff = {'BAT1_N_CELLS': {"Value": 6, "Type": 6}}
-                    unrecognized = self.unrecognized_params.get()
-                    print(update_drone_params(
-                        diff, self.connection, self.connection_read_lock))
-                    unsynced = []
-                    print("updated params")
-
-                    qgc_message = create_QGC_sync_message(
-                        diff, unrecognized, unsynced)
-                    self.connection.mav.statustext_send(
-                        mavutil.mavlink.MAV_SEVERITY_NOTICE, qgc_message.encode("utf-8"))
-                    self.stage_event.clear()
-
-
-def main_thread() -> None:
-    """
-    Multi-threaded main function for parameter synchronization.
-
-    Establishes MAVLink connection and creates three worker threads:
-    - HeartbeatThread: Monitors drone arm/disarm status
-    - FetchRefParamsThread: Periodically fetches reference parameters
-    - ParamUpdateThread: Applies parameter changes when staged
-
-    Uses threading events and queues for coordination between threads.
-    Includes test code that simulates parameter changes for development.
-
-    This is the more complex, multi-threaded implementation that allows
-    concurrent monitoring and updating of parameters.
-    """
-    connection = mavutil.mavlink_connection(MAVLINK_CONNECTION_URL, baud=BAUD)
-    if not connection:
-        logger.info(
-            f"Failed to establish MAVLink connection at {MAVLINK_CONNECTION_URL}")
-        return
-    logger.info(f"Mavlink connection established at:{MAVLINK_CONNECTION_URL}")
-    logger.info("Waiting for heartbeat...")
-    heartbeat = connection.recv_match(
-        type="HEARTBEAT", blocking=True, timeout=10)
-    while not heartbeat:
-        logger.info("Timed out waiting for heartbeat, trying again...")
-        heartbeat = connection.recv_match(
-            type="HEARTBEAT", blocking=True, timeout=10)
-    logger.info("Got heartbeat")
-    drone_params = get_params_on_drone(connection)
-    reference_params = get_reference_params()
-    reference_params = parse_params_file(reference_params)
-
-    armed = threading.Event()
-    staged = threading.Event()
-    stop = threading.Event()
-
-    staged_changes = queue.Queue()
-    unrecognized_params = queue.Queue()
-
-    connection_read_lock = threading.Lock()
-    connection_write_lock = threading.Lock()
-    drone_param_lock = threading.Lock()
-
-    heartbeat_thread = HeartbeatThread(connection=connection,
-                                       connection_lock=connection_read_lock,
-                                       arm_event=armed,
-                                       stop_event=stop)
-    refparam_thread = FetchRefParamsThread(arm_event=armed,
-                                           stage_event=staged,
-                                           stop_event=stop,
-                                           staged_changes=staged_changes,
-                                           unrecognized_params=unrecognized_params,
-                                           drone_params=drone_params,
-                                           drone_params_lock=drone_param_lock)
-    update_params_thread = ParamUpdateThread(connection=connection,
-                                             connection_write_lock=connection_write_lock,
-                                             connection_read_lock=connection_read_lock,
-                                             arm_event=armed,
-                                             stage_event=staged,
-                                             stop_event=stop,
-                                             staged_changes=staged_changes,
-                                             unrecognized_params=unrecognized_params)
-
-    heartbeat_thread.start()
-    refparam_thread.start()
-    update_params_thread.start()
-    while True:
-        staged_changes.put({'ASPD_SCALE_1': {'Value': 1.0, 'Type': 9},
-                            'BAT1_A_PER_V': {'Value': 36.367515563964844, 'Type': 9},
-                            'BAT1_CAPACITY': {'Value': -1.0, 'Type': 9},
-                            'BAT1_I_CHANNEL': {'Value': -1, 'Type': 6},
-                            'CAL_MAG0_ZSCALE': {'Value': 0.9313523173332214, 'Type': 9},
-                            'CAL_MAG1_ID': {'Value': 396809, 'Type': 6},
-                            'CAL_MAG1_PITCH': {'Value': 0.0, 'Type': 9},
-                            'CAL_MAG1_PRIO': {'Value': 75, 'Type': 6}, })
-        """'BAT1_A_PER_V': {'Value': 36.367515563964844, 'Type': 9}, 
-        'BAT1_CAPACITY': {'Value': -1.0, 'Type': 9}, 
-        'BAT1_I_CHANNEL': {'Value': -1, 'Type': 6}})"""
-        unrecognized_params.put({"BAT1_N_CELLS": {"Value": 6, "Type": 6}})
-        staged.set()
-        time.sleep(2)
-
-
 if __name__ == '__main__':
-    main_thread()
-    pass
+    main()
