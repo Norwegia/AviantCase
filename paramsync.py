@@ -20,10 +20,11 @@ MAVLINK_CONNECTION_URLS = [
     # "udpin:localhost:14540" # SITL
 ]
 BAUD = 57600
-REBOOT_ON_SYNC = False  # should the vehicle reboot when new parameters are synced
+# REBOOT_ON_SYNC = True  # should the vehicle reboot when new parameters are synced
 REF_PARAMS_REFRESH_PERIOD = 1  # s
-REF_PARAMS_GET_TIMEOUT = 2     # s
+REF_PARAMS_GET_TIMEOUT = 2  # s
 PARAM_ACKNOWLEDGE_TIMEOUT = 2  # s
+MAVLINK_LOSS_TIMEOUT = 2  # s
 
 MAV_PARAM_TYPE = {
     1: int,
@@ -275,60 +276,74 @@ def main() -> None:
     This is a simpler, single-threaded implementation that periodically refreshes
     both reference parameters and drone parameters, then synchronizes any differences.
     """
-    connection = False
-    for url in MAVLINK_CONNECTION_URLS:
-        try:
-            connection = mavutil.mavlink_connection(url, baud=BAUD)
-        except serial.serialutil.SerialException:
-            logger.error(f"Could not open {url}")
-    if not connection:
-        logger.info(
-            f"Failed to establish MAVLink connection with any of {MAVLINK_CONNECTION_URLS}")
-        return
-    logger.info(f"MAVlink connection established at: {url}")
-    logger.info("Waiting for heartbeat...")
-    heartbeat = connection.recv_match(
-        type="HEARTBEAT", blocking=True, timeout=10)
-    while not heartbeat:
-        logger.info("Timed out waiting for heartbeat, trying again...")
-        heartbeat = connection.recv_match(
-            type="HEARTBEAT", blocking=True, timeout=10)
-    logger.info("Got heartbeat")
-
-    drone_params = get_params_on_drone(connection)
-    reference_params = None
-    while reference_params is None:  # check for internet connection
-        reference_params = get_reference_params(connection)
-    ref_param_last_update = time.perf_counter()
-    armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-
     while True:
-        if not armed:
-            diff = {}
-            if time.perf_counter() - ref_param_last_update > REF_PARAMS_REFRESH_PERIOD:
-                reference_params = get_reference_params(connection)
-                ref_param_last_update = time.perf_counter()
-                if reference_params is None:  # failed to fetch from website
-                    continue
-                diff, unrecognized_params = compare_param_lists(
-                    reference_params, drone_params)
-                if diff:
-                    unacknowledged_params = update_drone_params(
-                        diff, connection)
-                    message = create_qgc_sync_message(
-                        diff, unrecognized_params, unacknowledged_params)
-                    logger.info(message)
-                    for param, value in diff.items():
-                        if param not in unacknowledged_params and param not in unrecognized_params:
-                            drone_params[param] = value
-                    connection.mav.statustext_send(
-                        mavutil.mavlink.MAV_SEVERITY_NOTICE, message.encode("utf-8"))
+        connected = False
+        for url in MAVLINK_CONNECTION_URLS:
+            try:
+                connection = mavutil.mavlink_connection(url, baud=BAUD)
+                connected = True
+            except serial.serialutil.SerialException:
+                logger.error(f"Could not open {url}")
+        if not connected:
+            logger.error(
+                f"Failed to establish MAVLink connection with any of {MAVLINK_CONNECTION_URLS}. Trying again...")
+            time.sleep(MAVLINK_LOSS_TIMEOUT)
+            continue
+        logger.info(f"MAVlink connection established at: {url}")
+        logger.info("Waiting for heartbeat...")
+        try:
+            heartbeat = connection.recv_match(
+                type="HEARTBEAT", blocking=True, timeout=10)
+            while not heartbeat:
+                logger.info("Timed out waiting for heartbeat, trying again...")
+                heartbeat = connection.recv_match(
+                    type="HEARTBEAT", blocking=True, timeout=10)
+        except serial.serialutil.SerialException:
+            logger.error(
+                "Error reading heartbeat. Retrying MAVLink connection...")
+            time.sleep(MAVLINK_LOSS_TIMEOUT)
+            continue
+        logger.info("Got heartbeat")
 
-        heartbeat = connection.recv_match(
-            type="HEARTBEAT", blocking=True, timeout=1)
-        if heartbeat:
-            logger.info("Got heartbeat")
-            armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+        drone_params = get_params_on_drone(connection)
+        reference_params = None
+        while reference_params is None:  # check for internet connection
+            reference_params = get_reference_params(connection)
+        ref_param_last_update = time.perf_counter()
+        armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+
+        while connected:
+            try:
+                if not armed:
+                    diff = {}
+                    if time.perf_counter() - ref_param_last_update > REF_PARAMS_REFRESH_PERIOD:
+                        reference_params = get_reference_params(connection)
+                        ref_param_last_update = time.perf_counter()
+                        if reference_params is None:  # failed to fetch from website
+                            continue
+                        diff, unrecognized_params = compare_param_lists(
+                            reference_params, drone_params)
+                        if diff:
+                            unacknowledged_params = update_drone_params(
+                                diff, connection)
+                            message = create_qgc_sync_message(
+                                diff, unrecognized_params, unacknowledged_params)
+                            for param, value in diff.items():
+                                if param not in unacknowledged_params and param not in unrecognized_params:
+                                    drone_params[param] = value
+                            logger.info(message)
+                            connection.mav.statustext_send(
+                                mavutil.mavlink.MAV_SEVERITY_NOTICE, message.encode("utf-8"))
+
+                heartbeat = connection.recv_match(
+                    type="HEARTBEAT", blocking=True, timeout=1)
+                if heartbeat:
+                    logger.info("Got heartbeat")
+                    armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+            except serial.serialutil.SerialException:  # handle loss of MAVLink connection during main loop gracefully
+                logger.error(
+                    "Error reading from MAVLink connection: {url}. Attempting to restablish connection...")
+                connected = False
 
 
 if __name__ == '__main__':
