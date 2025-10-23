@@ -13,6 +13,8 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 
+"""Global Params"""
+
 PARAMS_URL = "https://caseparams.sandbox.aviant.no/reference.params"
 MAVLINK_CONNECTION_URLS = [
     "/dev/tty.usbmodem01",  # OSX USB
@@ -20,7 +22,7 @@ MAVLINK_CONNECTION_URLS = [
     # "udpin:localhost:14540" # SITL
 ]
 BAUD = 57600
-# REBOOT_ON_SYNC = True  # should the vehicle reboot when new parameters are synced
+REBOOT_ON_SYNC = False  # should the vehicle reboot when new parameters are synced
 REF_PARAMS_REFRESH_PERIOD = 1  # s
 REF_PARAMS_GET_TIMEOUT = 2  # s
 PARAM_ACKNOWLEDGE_TIMEOUT = 2  # s
@@ -261,6 +263,8 @@ def create_qgc_sync_message(diff: Dict[str, Dict[str, Any]],
         message += "\nThe following parameters were not acknowledged after sync:\n\n"
         for param, value in unsynced_params.items():
             message += f"  {param}: {value['Value']}\n"
+    if not REBOOT_ON_SYNC:
+        message += "\nReboot vehicle for parameter changes to take effect."
     return message
 
 
@@ -334,6 +338,8 @@ def main() -> None:
                             logger.info(message)
                             connection.mav.statustext_send(
                                 mavutil.mavlink.MAV_SEVERITY_NOTICE, message.encode("utf-8"))
+                            if REBOOT_ON_SYNC:
+                                connection.reboot_autopilot()
 
                 heartbeat = connection.recv_match(
                     type="HEARTBEAT", blocking=True, timeout=1)
