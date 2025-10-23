@@ -7,7 +7,12 @@ import threading
 import queue
 from typing import Dict, Any, Tuple, List, Optional
 
-
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
 PARAMS_URL = "https://caseparams.sandbox.aviant.no/reference.params"
 MAVLINK_CONNECTION_URL = "/dev/tty.usbmodem01"
 BAUD = 57600
@@ -269,17 +274,18 @@ def main() -> None:
     """
     connection = mavutil.mavlink_connection(MAVLINK_CONNECTION_URL, baud=BAUD)
     if not connection:
-        print("Failed to get connection URL")
+        logger.info(
+            f"Failed to establish MAVLink connection at {MAVLINK_CONNECTION_URL}")
         return
-    print(f"Mavlink connection established at:{MAVLINK_CONNECTION_URL}")
-    print("Waiting for heartbeat...")
+    logger.info(f"Mavlink connection established at:{MAVLINK_CONNECTION_URL}")
+    logger.info("Waiting for heartbeat...")
     heartbeat = connection.recv_match(
         type="HEARTBEAT", blocking=True, timeout=10)
     while not heartbeat:
-        print("Timed out waiting for heartbeat, trying again...")
+        logger.info("Timed out waiting for heartbeat, trying again...")
         heartbeat = connection.recv_match(
             type="HEARTBEAT", blocking=True, timeout=10)
-    print("Got heartbeat")
+    logger.info("Got heartbeat")
     drone_params = get_params_on_drone(connection)
     reference_params = get_reference_params()
     reference_params = parse_params_file(reference_params)
@@ -292,14 +298,12 @@ def main() -> None:
             refresh = False
 
             if time.perf_counter() - ref_param_update_time > REF_PARAMS_REFRESH_PERIOD:
-                print("refresh ref params")
                 reference_params = get_reference_params()
                 reference_params = parse_params_file(reference_params)
                 ref_param_update_time = time.perf_counter()
                 refresh = True
 
             if time.perf_counter() - drone_param_update_time > DRONE_PARAMS_REFRESH_PERIOD:
-                print("refresh drone params")
                 drone_params = get_params_on_drone(connection)
                 drone_param_update_time = time.perf_counter()
                 refresh = True
@@ -307,20 +311,21 @@ def main() -> None:
             if refresh:
                 diff, unrecognized_params = compare_param_list(
                     reference_params, drone_params)
-                print(diff)
 
             if diff:
-                # update_drone_params(diff)
-                message = create_QGC_sync_message(diff, unrecognized_params)
+                unsynced = update_drone_params(diff)
+                message = create_QGC_sync_message(
+                    diff, unrecognized_params, unsynced)
+                logger.info(message)
                 drone_param_update_time = time.perf_counter()
                 for param, value in diff.items():
-                    drone_params[param] = value
+                    if param not in unsynced:
+                        drone_params[param] = value
                 connection.mav.statustext_send(
                     mavutil.mavlink.MAV_SEVERITY_NOTICE, message.encode("utf-8"))
 
         heartbeat = connection.recv_match(type="HEARTBEAT", blocking=False)
         if heartbeat:
-            print("Got heartbeat")
             armed = heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
 
 
@@ -490,17 +495,18 @@ def main_thread() -> None:
     """
     connection = mavutil.mavlink_connection(MAVLINK_CONNECTION_URL, baud=BAUD)
     if not connection:
-        print("Failed to get mavlink connection")
+        logger.info(
+            f"Failed to establish MAVLink connection at {MAVLINK_CONNECTION_URL}")
         return
-    print(f"Mavlink connection established at:{MAVLINK_CONNECTION_URL}")
-    print("Waiting for heartbeat...")
+    logger.info(f"Mavlink connection established at:{MAVLINK_CONNECTION_URL}")
+    logger.info("Waiting for heartbeat...")
     heartbeat = connection.recv_match(
         type="HEARTBEAT", blocking=True, timeout=10)
     while not heartbeat:
-        print("Timed out waiting for heartbeat, trying again...")
+        logger.info("Timed out waiting for heartbeat, trying again...")
         heartbeat = connection.recv_match(
             type="HEARTBEAT", blocking=True, timeout=10)
-    print("Got heartbeat")
+    logger.info("Got heartbeat")
     drone_params = get_params_on_drone(connection)
     reference_params = get_reference_params()
     reference_params = parse_params_file(reference_params)
