@@ -27,6 +27,7 @@ REF_PARAMS_REFRESH_PERIOD = 1  # s
 REF_PARAMS_GET_TIMEOUT = 2  # s
 PARAM_ACKNOWLEDGE_TIMEOUT = 2  # s
 MAVLINK_LOSS_TIMEOUT = 2  # s
+FLOAT_ACCEPTANCE_THRESHOLD = 1e-3
 
 MAV_PARAM_TYPE = {
     1: int,
@@ -229,7 +230,10 @@ def update_drone_params(params: Dict[str, Dict[str, Any]], connection: mavutil.m
         message = connection.recv_match(
             type="PARAM_VALUE", blocking=True, timeout=PARAM_ACKNOWLEDGE_TIMEOUT)
         if message:
-            if message.param_id.strip() in unacknowlaged:
+            param = message.param_id.strip()
+            value = struct.unpack(MAV_PARAM_FORMAT_TYPE[message.param_type], struct.pack(
+                'f', message.param_value))[0]
+            if param in unacknowlaged and unacknowlaged[param]["Value"] - value < FLOAT_ACCEPTANCE_THRESHOLD:
                 unacknowlaged.pop(message.param_id)
     return unacknowlaged
 
