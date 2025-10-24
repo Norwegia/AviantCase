@@ -16,10 +16,10 @@ logging.basicConfig(
 """Global Params"""
 
 PARAMS_URL = "https://caseparams.sandbox.aviant.no/reference.params"
-MAVLINK_CONNECTION_URLS = [
+MAVLINK_CONNECTION_ADDRESSES = [
     "/dev/tty.usbmodem01",  # OSX USB
-    # "/dev/ttyAMA0",  # Linux Serial
-    # "udpin:localhost:14540" # SITL
+    "/dev/ttyAMA0",  # Linux Serial
+    "udpin:localhost:14540"  # SITL
 ]
 BAUD = 57600
 REBOOT_ON_SYNC = False  # should the vehicle reboot when new parameters are synced
@@ -282,18 +282,19 @@ def main() -> None:
     """
     while True:
         connected = False
-        for url in MAVLINK_CONNECTION_URLS:
+        for address in MAVLINK_CONNECTION_ADDRESSES:
             try:
-                connection = mavutil.mavlink_connection(url, baud=BAUD)
+                connection = mavutil.mavlink_connection(address, baud=BAUD)
                 connected = True
+                break
             except serial.serialutil.SerialException:
-                logger.error(f"Could not open {url}")
+                logger.error(f"Could not open {address}")
         if not connected:
             logger.error(
-                f"Failed to establish MAVLink connection with any of {MAVLINK_CONNECTION_URLS}. Trying again...")
+                f"Failed to establish MAVLink connection with any of {MAVLINK_CONNECTION_ADDRESSES}. Trying again...")
             time.sleep(MAVLINK_LOSS_TIMEOUT)
             continue
-        logger.info(f"MAVlink connection established at: {url}")
+        logger.info(f"MAVlink connection established at: {address}")
         logger.info("Waiting for heartbeat...")
         try:
             heartbeat = connection.recv_match(
